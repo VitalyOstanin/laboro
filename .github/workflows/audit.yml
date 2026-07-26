@@ -19,14 +19,15 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The action shells out to `cargo audit` in the checkout root, so
+      # .cargo/audit.toml is picked up on its own -- the ignore list lives
+      # there only (all of it informational advisories in transitive Tauri/GTK
+      # deps, see that file for the per-entry rationale). Passing the ids again
+      # through the action's `ignore:` input would just duplicate them in the
+      # audit settings and leave two lists to keep in sync.
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # This action does not read .cargo/audit.toml, so the ignored
-          # advisories are duplicated here (see .cargo/audit.toml for the
-          # rationale). Both are transitive Tauri/GTK deps not reachable from
-          # our code: glib 0.18 unsoundness and proc-macro-error unmaintained.
-          ignore: RUSTSEC-2024-0429,RUSTSEC-2024-0370
 
   # Enforce the dependency license policy (deny.toml): a dependency update that
   # pulls in a copyleft crate fails here instead of shipping in a binary release.

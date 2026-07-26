@@ -1,10 +1,13 @@
 # cargo-audit / rustsec-audit-check configuration.
 #
-# The ignored advisories below are all in transitive dependencies pulled in by
-# the Tauri/GTK desktop stack (webkit2gtk-sys -> glib 0.18, macro crates ->
-# proc-macro-error). They are not reachable from our own code and cannot be
-# resolved without a major Tauri/GTK upgrade, which is tracked separately. Each
-# entry is revisited whenever the Tauri stack is bumped.
+# Every ignored advisory below is informational (unmaintained or unsound) and
+# sits in a transitive dependency of the Tauri/GTK desktop stack. None is a
+# vulnerability, none is reachable from our own code, and none can be resolved
+# without an upstream Tauri change. The pure-Rust crates (core, cli) pull in
+# none of them: they enter the tree only through gui/src-tauri.
+#
+# Each entry is revisited whenever the Tauri stack is bumped -- drop the ids
+# that no longer show up in `cargo audit` output.
 [advisories]
 ignore = [
     # glib 0.18: unsoundness in VariantStrIter Iterator/DoubleEndedIterator
@@ -14,4 +17,31 @@ ignore = [
     # proc-macro-error 1.0.4: unmaintained. Build-time only, transitive via the
     # GTK macro crates. No runtime exposure; superseded by proc-macro-error2.
     "RUSTSEC-2024-0370",
+
+    # gtk-rs GTK3 bindings 0.18.2, archived upstream in favour of gtk4-rs.
+    # tauri 2.11 reaches them through tao, wry, webkit2gtk, and
+    # tray-icon -> libappindicator / muda. Tauri still targets WebKitGTK 4.1
+    # (GTK3), so the only fix is the upstream GTK4 migration:
+    # tauri-apps/tauri#7335 and #11942 (plus #12561, #12562, #12563).
+    "RUSTSEC-2024-0411", # gdkwayland-sys
+    "RUSTSEC-2024-0412", # gdk
+    "RUSTSEC-2024-0413", # atk
+    "RUSTSEC-2024-0414", # gdkx11-sys
+    "RUSTSEC-2024-0415", # gtk
+    "RUSTSEC-2024-0416", # atk-sys
+    "RUSTSEC-2024-0417", # gdkx11
+    "RUSTSEC-2024-0418", # gdk-sys
+    "RUSTSEC-2024-0419", # gtk3-macros
+    "RUSTSEC-2024-0420", # gtk-sys
+
+    # rust-unic crates 0.9.0, unmaintained since 2025-10-18. A single chain:
+    # tauri-utils -> urlpattern 0.3 -> unic-ucd-ident -> the rest. urlpattern
+    # dropped unic in 0.4.0 (icu_properties instead), but tauri-utils 2.9.3 --
+    # the current release -- still requires urlpattern ^0.3, so this clears
+    # once Tauri bumps it.
+    "RUSTSEC-2025-0075", # unic-char-range
+    "RUSTSEC-2025-0080", # unic-common
+    "RUSTSEC-2025-0081", # unic-char-property
+    "RUSTSEC-2025-0098", # unic-ucd-version
+    "RUSTSEC-2025-0100", # unic-ucd-ident
 ]
