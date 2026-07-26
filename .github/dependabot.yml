@@ -9,3 +9,10 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    # dtolnay/rust-toolchain refs select a Rust toolchain, not an action
+    # version: `@stable` is a rolling branch that is force-pushed on every Rust
+    # release, so a pinned SHA stops being reachable from any branch and
+    # Dependabot aborts the whole update run with "no such commit". The pin is
+    # refreshed by hand instead.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
