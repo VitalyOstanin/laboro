@@ -1,11 +1,16 @@
 name: Audit
+# The audit configuration itself (.cargo/audit.toml, deny.toml, this file) is
+# in the path filter too: editing an ignore list without re-running the audit
+# leaves the change unverified until the next Monday cron. workflow_dispatch
+# allows the same check on demand.
 on:
   push:
-    paths: ["**/Cargo.toml", "**/Cargo.lock", "deny.toml"]
+    paths: ["**/Cargo.toml", "**/Cargo.lock", "deny.toml", ".cargo/audit.toml", ".github/workflows/audit.yml"]
   pull_request:
-    paths: ["**/Cargo.toml", "**/Cargo.lock", "deny.toml"]
+    paths: ["**/Cargo.toml", "**/Cargo.lock", "deny.toml", ".cargo/audit.toml", ".github/workflows/audit.yml"]
   schedule:
     - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
