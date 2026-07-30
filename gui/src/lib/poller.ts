@@ -129,6 +129,13 @@ let unsubActive: (() => void) | undefined;
 /** Aggregate timelog refresh interval (seconds). */
 const TIMELOG_INTERVAL_SECS = 120;
 
+/** Shortest gap between two focus/online-triggered refreshes (see
+ * [`refreshOnResume`]). */
+const RESUME_MIN_GAP_MS = 60_000;
+
+/** When the last full refresh finished, for the gap above. */
+let lastRefreshDoneMs = 0;
+
 /** Load the server list, seed the active server, and start per-server polling. */
 export async function startPolling(): Promise<void> {
   const list = await listServers();
@@ -162,8 +169,9 @@ export async function startPolling(): Promise<void> {
 
   // setInterval timers are suspended while the system sleeps and resume only on
   // the next tick, so data is stale for up to one interval after wake. Refresh
-  // immediately when the window regains focus or connectivity is restored.
-  resumeHandler = () => void refreshAll();
+  // when the window regains focus or connectivity is restored, throttled so
+  // ordinary window switching does not restart the poll each time.
+  resumeHandler = () => void refreshOnResume();
   window.addEventListener("focus", resumeHandler);
   window.addEventListener("online", resumeHandler);
 
@@ -196,7 +204,19 @@ export async function refreshAll(): Promise<void> {
     await Promise.all([...enabled.map((s) => pollOnce(s)), refreshTimelog()]);
   } finally {
     resuming = false;
+    lastRefreshDoneMs = Date.now();
   }
+}
+
+/**
+ * Refresh after the window regained focus or connectivity, unless one just
+ * finished. Without this every return to the window starts a full refresh, and
+ * a slow backend (GitHub polls several endpoints per server) would then be
+ * synchronizing more or less permanently while the window is in use.
+ */
+export async function refreshOnResume(): Promise<void> {
+  if (Date.now() - lastRefreshDoneMs < RESUME_MIN_GAP_MS) return;
+  await refreshAll();
 }
 
 /** Refresh a single server now (after a write action). */
@@ -303,72 +323,134 @@ export function seedFromCache(): void {
  */
 async function pollOnce(s: ServerInfo): Promise<void> {
   setSyncPhase(s.name, "syncing");
-  try {
-    const [tasks, notifs] = await Promise.all([
-      listTasks(s.name, 1),
-      listNotifications(s.name, 1),
-    ]);
-    const unread = notifs.items.filter(unreadOf).length;
-    summaries.update((m) => ({ ...m, [s.name]: { error: null, unread } }));
-    setSyncPhase(s.name, "idle", Date.now());
-    writeCache(
-      s.name,
-      toCacheEntry(
-        {
-          tasks: tasks.items,
-          notifications: notifs.items,
-          error: null,
-          taskCursor: tasks.next_offset,
-          notifCursor: notifs.next_offset,
-        },
-        unread,
-        Date.now(),
-      ),
-    );
-    // Announce items that became unread since the last poll (all servers, not
-    // just the active one).
-    maybeNotify(s, notifs.items);
-    // Re-read after the await: the user may have switched servers while the
-    // requests were in flight. Deciding by the pre-await snapshot would let a
-    // stale poll leave resident arrays on a now-inactive server.
-    if (get(activeServer) === s.name) {
-      byServer.update((by) => ({
-        ...by,
-        [s.name]: {
-          tasks: tasks.items,
-          notifications: notifs.items,
-          error: null,
-          taskCursor: tasks.next_offset,
-          notifCursor: notifs.next_offset,
-        },
-      }));
-    } else {
-      // Not active: drop any resident arrays; the summary above is enough.
-      byServer.update((by) => {
-        if (!(s.name in by)) return by;
-        const { [s.name]: _drop, ...rest } = by;
-        return rest;
+  // The two halves are applied as each arrives rather than after both, so the
+  // task column is not held back by the notification request (on GitHub the
+  // latter also resolves CI links, which costs extra round-trips).
+  const [tasksRes, notifsRes] = await Promise.allSettled([
+    listTasks(s.name, 1).then((page) => {
+      applyPart(s.name, {
+        tasks: page.items,
+        taskCursor: page.next_offset,
+        error: null,
       });
-    }
-  } catch (e) {
+      return page;
+    }),
+    fetchNotifications(s),
+  ]);
+
+  if (tasksRes.status === "rejected" || notifsRes.status === "rejected") {
+    const message = String(
+      tasksRes.status === "rejected"
+        ? tasksRes.reason
+        : notifsRes.status === "rejected"
+          ? notifsRes.reason
+          : "",
+    );
     summaries.update((m) => ({
       ...m,
-      [s.name]: { error: String(e), unread: m[s.name]?.unread ?? 0 },
+      [s.name]: { error: message, unread: m[s.name]?.unread ?? 0 },
     }));
     setSyncPhase(s.name, "stale");
-    if (get(activeServer) === s.name) {
-      byServer.update((by) => ({
-        ...by,
-        [s.name]: {
-          tasks: by[s.name]?.tasks ?? [],
-          notifications: by[s.name]?.notifications ?? [],
-          error: String(e),
-          taskCursor: by[s.name]?.taskCursor ?? null,
-          notifCursor: by[s.name]?.notifCursor ?? null,
-        },
-      }));
-    }
+    // Whatever half did arrive stays; only the error flag is added on top.
+    applyPart(s.name, { error: message });
+    return;
   }
+
+  setSyncPhase(s.name, "idle", Date.now());
+  const state: ServerState = {
+    tasks: tasksRes.value.items,
+    notifications: notifsRes.value.items,
+    error: null,
+    taskCursor: tasksRes.value.next_offset,
+    notifCursor: notifsRes.value.next_offset,
+  };
+  writeCache(
+    s.name,
+    toCacheEntry(
+      state,
+      notifsRes.value.items.filter(unreadOf).length,
+      Date.now(),
+    ),
+  );
+}
+
+/** Fetch a server's first page of notifications and apply it: unread summary,
+ * resident array, desktop banners for what is newly unread. */
+async function fetchNotifications(
+  s: ServerInfo,
+): Promise<Awaited<ReturnType<typeof listNotifications>>> {
+  const page = await listNotifications(s.name, 1);
+  const unread = page.items.filter(unreadOf).length;
+  summaries.update((m) => ({ ...m, [s.name]: { error: null, unread } }));
+  applyPart(s.name, {
+    notifications: page.items,
+    notifCursor: page.next_offset,
+    error: null,
+  });
+  // Announce items that became unread since the last poll (all servers, not
+  // just the active one).
+  maybeNotify(s, page.items);
+  return page;
+}
+
+/**
+ * Refresh only a server's notifications. Used after writing a read state, where
+ * the task list cannot have changed — reloading it too would double the work of
+ * an action whose whole effect is on one column.
+ */
+export async function refreshNotifications(name: string): Promise<void> {
+  const s = get(servers).find((x) => x.name === name);
+  if (!s) return;
+  setSyncPhase(name, "syncing");
+  try {
+    const page = await fetchNotifications(s);
+    setSyncPhase(name, "idle", Date.now());
+    // Keep the on-disk cache consistent with what is now on screen; the task
+    // half comes from the resident state, which this refresh left untouched.
+    const cur = get(byServer)[name];
+    if (cur) {
+      writeCache(
+        name,
+        toCacheEntry(cur, page.items.filter(unreadOf).length, Date.now()),
+      );
+    }
+  } catch (e) {
+    const message = String(e);
+    summaries.update((m) => ({
+      ...m,
+      [name]: { error: message, unread: m[name]?.unread ?? 0 },
+    }));
+    setSyncPhase(name, "stale");
+    applyPart(name, { error: message });
+  }
+}
+
+/**
+ * Merge one finished half of a poll into a server's resident state. The active
+ * server is re-read here, after the request settled: the user may have switched
+ * servers while it was in flight, and deciding by the pre-request snapshot would
+ * let a stale poll leave resident arrays on a now-inactive server (whose summary
+ * alone is enough).
+ */
+function applyPart(name: string, part: Partial<ServerState>): void {
+  if (get(activeServer) !== name) {
+    byServer.update((by) => {
+      if (!(name in by)) return by;
+      const { [name]: _drop, ...rest } = by;
+      return rest;
+    });
+    return;
+  }
+  byServer.update((by) => {
+    const cur: ServerState = by[name] ?? {
+      tasks: [],
+      notifications: [],
+      error: null,
+      taskCursor: null,
+      notifCursor: null,
+    };
+    return { ...by, [name]: { ...cur, ...part } };
+  });
 }
 
 /** Append the next page of tasks for a resident server, following its cursor. */

@@ -20,6 +20,17 @@ The format follows Keep a Changelog and Semantic Versioning.
   the keyring itself; the token is read once per process. Concurrent keyring
   reads serialize on the Secret Service, which showed as 5.7 s against 2.1 s over
   fifteen parallel calls.
+- The dashboard applies tasks and notifications as each arrives instead of after
+  both, and a refresh triggered by the window regaining focus is skipped when one
+  has just finished, so ordinary window switching no longer restarts a full
+  synchronization every time.
+- The reload that follows a read-state write refreshes only the notification
+  column instead of the whole server.
+
+### Fixed
+- Marking all notifications read no longer shows two spinners at once: the button
+  reports the write itself, and the reload that follows is reported only by the
+  sync bar (the button stays disabled meanwhile).
 
 ## [0.1.8] - 2026-07-21
 

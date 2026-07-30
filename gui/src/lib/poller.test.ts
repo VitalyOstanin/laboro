@@ -14,7 +14,13 @@ vi.mock("./api", () => ({
 }));
 
 import * as api from "./api";
-import { refreshAll, refreshServer, loadMoreTasks } from "./poller";
+import {
+  refreshAll,
+  refreshOnResume,
+  refreshServer,
+  refreshNotifications,
+  loadMoreTasks,
+} from "./poller";
 import { servers, byServer, summaries, activeServer } from "./store";
 import { makeTask, makeNotif } from "./test-fixtures";
 import type { ServerInfo } from "./types";
@@ -53,6 +59,42 @@ describe("refreshAll", () => {
       .sort();
     expect(polled).toEqual(["a", "c"]);
     expect(api.getTimelog).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips a resume refresh that follows one just finished", async () => {
+    servers.set([srv("a", true)]);
+    await refreshAll();
+    const after = vi.mocked(api.listTasks).mock.calls.length;
+    await refreshOnResume();
+    // Within the gap the focus-triggered refresh is a no-op...
+    expect(vi.mocked(api.listTasks).mock.calls.length).toBe(after);
+    // ...and it runs again once enough time has passed.
+    vi.setSystemTime(Date.now() + 61_000);
+    await refreshOnResume();
+    expect(vi.mocked(api.listTasks).mock.calls.length).toBeGreaterThan(after);
+  });
+
+  it("shows tasks before the notification request settles", async () => {
+    servers.set([srv("a", true)]);
+    activeServer.set("a");
+    let releaseNotifs: () => void = () => {};
+    vi.mocked(api.listNotifications).mockImplementationOnce(
+      () =>
+        new Promise(
+          (r) =>
+            (releaseNotifs = () => r(page([makeNotif({ id: "n1" })], null))),
+        ),
+    );
+    vi.mocked(api.listTasks).mockResolvedValueOnce(page([makeTask()], null));
+    const polling = refreshAll();
+    // Let the resolved task request settle while notifications are still open.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(get(byServer).a?.tasks).toHaveLength(1);
+    expect(get(byServer).a?.notifications ?? []).toHaveLength(0);
+    releaseNotifs();
+    await polling;
+    expect(get(byServer).a?.notifications).toHaveLength(1);
   });
 
   it("guards against overlapping runs", async () => {
@@ -97,6 +139,33 @@ describe("residency and summaries", () => {
     // Both servers carry an unread summary (both notifications count as unread).
     expect(get(summaries).a?.unread).toBe(2);
     expect(get(summaries).b?.unread).toBe(2);
+  });
+
+  it("refreshNotifications reloads only the notification column", async () => {
+    vi.mocked(api.listTasks).mockResolvedValue(
+      page<Task>([makeTask({ id: { display: "#1", raw: "1" } })], null),
+    );
+    vi.mocked(api.listNotifications).mockResolvedValue(
+      page<Notification>([makeNotif({ read: false })], null),
+    );
+    await refreshServer("a");
+    vi.clearAllMocks();
+
+    vi.mocked(api.listNotifications).mockResolvedValue(
+      page<Notification>(
+        [
+          makeNotif({ id: "1", read: true }),
+          makeNotif({ id: "2", read: true }),
+        ],
+        null,
+      ),
+    );
+    await refreshNotifications("a");
+    // The task request is not repeated; a read-state write cannot change tasks.
+    expect(api.listTasks).not.toHaveBeenCalled();
+    expect(get(byServer).a?.notifications).toHaveLength(2);
+    expect(get(byServer).a?.tasks).toHaveLength(1);
+    expect(get(summaries).a?.unread).toBe(0);
   });
 
   it("records the error in the summary on failure", async () => {

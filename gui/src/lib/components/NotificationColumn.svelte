@@ -10,7 +10,7 @@
     type NotifView,
   } from "../store";
   import { setNotificationRead, markAllRead } from "../api";
-  import { refreshServer } from "../poller";
+  import { refreshNotifications } from "../poller";
   import { onVisible } from "../scroll";
   import { fieldKeys } from "../keys";
   import { openExternal } from "../external";
@@ -91,20 +91,34 @@
   const canToggle = $derived(canToggleRead(server));
   // Async feedback (project rule): show which dot is in flight, disable it while
   // the toggle runs. `busyId` is the notification being toggled; `busyAll` marks
-  // the mark-all action. Any in-flight action blocks the others.
+  // the mark-all action. Any in-flight action blocks the others, including the
+  // reload that follows one — but the reload reports itself through the sync bar
+  // rather than a second spinner here, so one phase never lights two indicators.
   let busyId = $state<number | null>(null);
   let busyAll = $state(false);
-  const anyBusy = $derived(busyId !== null || busyAll);
+  let reloading = $state(false);
+  const anyBusy = $derived(busyId !== null || busyAll || reloading);
+
+  /** Reload the column after a read-state write. Only notifications can have
+   * changed, so the task list is left alone. */
+  async function reload(name: string): Promise<void> {
+    reloading = true;
+    try {
+      await refreshNotifications(name);
+    } finally {
+      reloading = false;
+    }
+  }
 
   async function toggle(n: Notification): Promise<void> {
     if (!server || anyBusy) return;
     busyId = Number(n.id);
     try {
       await setNotificationRead(server.name, Number(n.id), unreadOf(n));
-      await refreshServer(server.name);
     } finally {
       busyId = null;
     }
+    await reload(server.name);
   }
 
   async function markAll(): Promise<void> {
@@ -112,10 +126,10 @@
     busyAll = true;
     try {
       await markAllRead(server.name);
-      await refreshServer(server.name);
     } finally {
       busyAll = false;
     }
+    await reload(server.name);
   }
 
   // Opening the notification's work package on the task-detail screen is a
