@@ -7,6 +7,10 @@
 //! Output is normalized to the same shape as an OpenProject work package so the
 //! CLI and GUI can render both backends uniformly.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+
 use serde::Serialize;
 use serde_json::Value;
 
@@ -91,11 +95,55 @@ pub fn gh_account_for_host(host: &str) -> Result<GhAccount, Error> {
     )
 }
 
+/// How many `gh` processes may run at once in [`GhRunner::run_batch`]. Every
+/// invocation is its own process, and the count of batched calls follows the
+/// data (one per repository with a CI notification), so the fan-out is capped
+/// here rather than left to grow with the inbox. Ten is far below GitHub's
+/// hundred-concurrent-request secondary limit while covering the usual batch in
+/// a single wave.
+const MAX_PARALLEL_GH: usize = 10;
+
 /// Abstraction over invoking `gh`, so tests can feed fixtures instead of
 /// spawning the real process.
 pub trait GhRunner {
     /// Run `gh` with `args`, returning captured stdout on success.
     fn run(&self, args: &[&str]) -> Result<Vec<u8>, Error>;
+
+    /// Run independent invocations, returning one result per call in input
+    /// order. The default is sequential; [`GhCli`] overrides it with a bounded
+    /// parallel version. Order is part of the contract: callers rely on it to
+    /// keep result priority (see [`GithubBackend::list_my_tasks`]).
+    fn run_batch(&self, calls: &[Vec<String>]) -> Vec<Result<Vec<u8>, Error>> {
+        calls.iter().map(|c| self.run(&as_args(c))).collect()
+    }
+
+    /// Key identifying the account this runner talks to, for process-wide
+    /// caches. `None` disables caching, which is what fakes want so tests never
+    /// observe each other's entries.
+    fn cache_key(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// A reference runs like the runner it points at, so a caller can keep ownership
+/// (and inspect the runner afterwards) while handing it to a backend.
+impl<T: GhRunner + ?Sized> GhRunner for &T {
+    fn run(&self, args: &[&str]) -> Result<Vec<u8>, Error> {
+        (**self).run(args)
+    }
+
+    fn run_batch(&self, calls: &[Vec<String>]) -> Vec<Result<Vec<u8>, Error>> {
+        (**self).run_batch(calls)
+    }
+
+    fn cache_key(&self) -> Option<&str> {
+        (**self).cache_key()
+    }
+}
+
+/// Borrow an owned argument vector as the `&[&str]` slice [`GhRunner::run`] takes.
+fn as_args(args: &[String]) -> Vec<&str> {
+    args.iter().map(String::as_str).collect()
 }
 
 /// Real runner: spawns `gh`, pinning the host via `GH_HOST` (github.com or an
@@ -112,6 +160,13 @@ impl GhRunner for GhCli {
         if !self.host.is_empty() {
             cmd.env("GH_HOST", &self.host);
         }
+        // Hand the token down explicitly so each `gh` skips its own keyring read.
+        // Concurrent reads serialize on the Secret Service: fifteen parallel calls
+        // measured 5.7 s reading the keyring against 2.1 s with the token in the
+        // environment.
+        if let Some(token) = cached_token(&self.host) {
+            cmd.env("GH_TOKEN", token);
+        }
         let out = cmd
             .output()
             .map_err(|e| Error::Io(format!("spawn gh: {e}")))?;
@@ -124,6 +179,43 @@ impl GhRunner for GhCli {
             )));
         }
         Ok(out.stdout)
+    }
+
+    /// Spawn the calls concurrently, at most [`MAX_PARALLEL_GH`] at a time.
+    /// Workers pull from a shared cursor rather than taking a fixed slice each,
+    /// so a slow repository does not hold back the rest of the batch.
+    fn run_batch(&self, calls: &[Vec<String>]) -> Vec<Result<Vec<u8>, Error>> {
+        /// One batch entry's result, filled by whichever worker took it.
+        type Slot = Mutex<Option<Result<Vec<u8>, Error>>>;
+        let slots: Vec<Slot> = calls.iter().map(|_| Mutex::new(None)).collect();
+        let next = AtomicUsize::new(0);
+        let workers = calls.len().min(MAX_PARALLEL_GH);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(call) = calls.get(i) else { break };
+                    let result = self.run(&as_args(call));
+                    *slots[i].lock().expect("gh batch slot poisoned") = Some(result);
+                });
+            }
+        });
+        slots
+            .into_iter()
+            .map(|s| {
+                s.into_inner()
+                    .expect("gh batch slot poisoned")
+                    .expect("every batch slot is filled before the scope ends")
+            })
+            .collect()
+    }
+
+    fn cache_key(&self) -> Option<&str> {
+        Some(if self.host.is_empty() {
+            "github.com"
+        } else {
+            &self.host
+        })
     }
 }
 
@@ -421,6 +513,130 @@ fn dedup_by_id(tasks: Vec<entities::Task>) -> Vec<entities::Task> {
         .collect()
 }
 
+/// Arguments for one `gh search` invocation: the shared `--state open` and
+/// `--json` tail with the caller's filter (`--involves @me`, `--owner <login>`,
+/// `--review-requested @me`) spliced in.
+fn search_args(what: &str, filter: &[&str], fields: &str) -> Vec<String> {
+    let mut args = vec!["search".to_owned(), what.to_owned()];
+    args.extend(filter.iter().map(|s| (*s).to_owned()));
+    args.extend([
+        "--state".to_owned(),
+        "open".to_owned(),
+        "--json".to_owned(),
+        fields.to_owned(),
+    ]);
+    args
+}
+
+/// Projection applied to the Actions API response, keeping only the four fields
+/// [`match_run_url`] reads. A hundred full run objects are on the order of a
+/// megabyte per repository; the four fields are a few kilobytes.
+const RUNS_JQ: &str = "[.workflow_runs[] | {name, head_branch, updated_at, html_url}]";
+
+/// Arguments reading one repository's recent workflow runs, already projected
+/// down to the fields the matcher needs.
+fn runs_args(repo: &str) -> Vec<String> {
+    vec![
+        "api".to_owned(),
+        format!("repos/{repo}/actions/runs?per_page={GITHUB_MAX_PER_PAGE}"),
+        "--jq".to_owned(),
+        RUNS_JQ.to_owned(),
+    ]
+}
+
+/// Parse the projected run list, or `None` when the output is not the expected
+/// array (kept non-fatal: the notification keeps its Actions-page link).
+fn parse_runs(raw: &[u8]) -> Option<Vec<Value>> {
+    serde_json::from_slice::<Vec<Value>>(raw).ok()
+}
+
+/// Login per account, filled on first lookup and kept for the life of the
+/// process (see [`GithubBackend::my_login`]).
+fn login_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `gh`'s own token per host, read once and reused for the life of the process.
+/// The inner `Option` records a failed read (not signed in, or `gh` absent) so it
+/// is not retried on every call.
+#[allow(clippy::type_complexity)]
+fn token_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The token `gh` would use for `host`, for passing down to child invocations as
+/// `GH_TOKEN`. Read at most once per host: the read itself spawns `gh auth token`,
+/// which hits the keyring exactly the once this is meant to avoid repeating.
+/// `None` when `gh` cannot produce one, in which case children fall back to their
+/// own keyring lookup as before.
+fn cached_token(host: &str) -> Option<String> {
+    let key = if host.is_empty() { "github.com" } else { host };
+    let mut cache = token_cache().lock().expect("token cache poisoned");
+    if let Some(known) = cache.get(key) {
+        return known.clone();
+    }
+    let token = read_gh_token(host);
+    cache.insert(key.to_owned(), token.clone());
+    token
+}
+
+/// Spawn `gh auth token` directly rather than through [`GhCli::run`], which would
+/// ask for the very token being read.
+fn read_gh_token(host: &str) -> Option<String> {
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args(["auth", "token"]);
+    if !host.is_empty() {
+        cmd.env("GH_HOST", host);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let token = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!token.is_empty()).then_some(token)
+}
+
+/// One repository's workflow runs as last read, with the instant they were read.
+struct CachedRuns {
+    fetched_at: chrono::DateTime<chrono::Utc>,
+    runs: Vec<Value>,
+}
+
+/// Workflow runs per `(account, repository)`, refilled by
+/// [`GithubBackend::recent_runs_for`].
+fn runs_cache() -> &'static Mutex<HashMap<(String, String), CachedRuns>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, String), CachedRuns>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Upper bound on how long a cached run list is reused, regardless of the
+/// freshness check below. Bounds staleness of everything the check cannot see
+/// (a run renamed or deleted, say) without making the cache useless between
+/// polls.
+const RUNS_CACHE_TTL_SECS: i64 = 600;
+
+/// Whether a cached run list can answer for a notification updated at
+/// `notif_updated`. Two conditions: the snapshot is younger than the TTL, and it
+/// was taken *after* the notification was last updated — in which case the run
+/// the notification refers to already existed when the snapshot was read, so
+/// refetching cannot produce a different match. A notification timestamp that
+/// does not parse is treated as unusable and forces a refetch.
+fn runs_cache_is_fresh(
+    fetched_at: chrono::DateTime<chrono::Utc>,
+    notif_updated: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if (now - fetched_at).num_seconds() >= RUNS_CACHE_TTL_SECS {
+        return false;
+    }
+    match notif_updated.and_then(parse_ts) {
+        Some(updated) => updated.with_timezone(&chrono::Utc) <= fetched_at,
+        None => false,
+    }
+}
+
 /// GitHub backend over a [`GhRunner`]: reads tasks/notifications and marks
 /// notifications read.
 pub struct GithubBackend<R: GhRunner> {
@@ -433,10 +649,31 @@ impl<R: GhRunner> GithubBackend<R> {
     }
 
     /// The authenticated user's login, for owner-scoped searches (`gh search`
-    /// takes a concrete login for `--owner`, not `@me`).
+    /// takes a concrete login for `--owner`, not `@me`). Cached per account for
+    /// the life of the process: the login cannot change without re-authenticating
+    /// `gh`, and the lookup is a network round-trip on every poll otherwise. A
+    /// runner without a [`GhRunner::cache_key`] (every fake) always asks.
     fn my_login(&self) -> Result<String, Error> {
+        let key = self.runner.cache_key().map(str::to_owned);
+        if let Some(k) = key.as_deref() {
+            let hit = login_cache()
+                .lock()
+                .expect("login cache poisoned")
+                .get(k)
+                .cloned();
+            if let Some(login) = hit {
+                return Ok(login);
+            }
+        }
         let raw = self.runner.run(&["api", "user", "--jq", ".login"])?;
-        Ok(String::from_utf8_lossy(&raw).trim().to_string())
+        let login = String::from_utf8_lossy(&raw).trim().to_string();
+        if let Some(k) = key {
+            login_cache()
+                .lock()
+                .expect("login cache poisoned")
+                .insert(k, login.clone());
+        }
+        Ok(login)
     }
 
     /// Everything on GitHub that needs my attention, aggregated and de-duplicated:
@@ -451,85 +688,41 @@ impl<R: GhRunner> GithubBackend<R> {
             "number,title,state,repository,assignees,createdAt,updatedAt,url,isDraft";
         let login = self.my_login()?;
 
-        let mut out = Vec::new();
-        // Issues: anything I'm involved in, plus everything open in my repos.
-        // `reason` records why each item is in the list; the more specific search
-        // runs first so its reason wins over `Own`/`Involved` on dedup.
-        for (args, reason) in [
+        // The five searches are independent, so they go out as one batch. Their
+        // order still decides priority: `run_batch` answers in input order, and
+        // the more specific search precedes the broader one so its `reason` wins
+        // when dedup collapses an item that surfaced in several searches.
+        let searches = [
             (
-                vec![
-                    "search",
-                    "issues",
-                    "--involves",
-                    "@me",
-                    "--state",
-                    "open",
-                    "--json",
-                    ISSUE_FIELDS,
-                ],
+                search_args("issues", &["--involves", "@me"], ISSUE_FIELDS),
+                TaskKind::Issue,
                 InboxReason::Involved,
             ),
             (
-                vec![
-                    "search",
-                    "issues",
-                    "--owner",
-                    &login,
-                    "--state",
-                    "open",
-                    "--json",
-                    ISSUE_FIELDS,
-                ],
+                search_args("issues", &["--owner", &login], ISSUE_FIELDS),
+                TaskKind::Issue,
                 InboxReason::Own,
             ),
-        ] {
-            out.extend(parse_tasks(
-                &self.runner.run(&args)?,
-                TaskKind::Issue,
-                reason,
-            )?);
-        }
-        // PRs: review requested from me (highest-priority reason) first, then
-        // involving me, then everything in my repos.
-        for (args, reason) in [
             (
-                vec![
-                    "search",
-                    "prs",
-                    "--review-requested",
-                    "@me",
-                    "--state",
-                    "open",
-                    "--json",
-                    PR_FIELDS,
-                ],
+                search_args("prs", &["--review-requested", "@me"], PR_FIELDS),
+                TaskKind::PullRequest,
                 InboxReason::ReviewRequested,
             ),
             (
-                vec![
-                    "search",
-                    "prs",
-                    "--involves",
-                    "@me",
-                    "--state",
-                    "open",
-                    "--json",
-                    PR_FIELDS,
-                ],
+                search_args("prs", &["--involves", "@me"], PR_FIELDS),
+                TaskKind::PullRequest,
                 InboxReason::Involved,
             ),
             (
-                vec![
-                    "search", "prs", "--owner", &login, "--state", "open", "--json", PR_FIELDS,
-                ],
+                search_args("prs", &["--owner", &login], PR_FIELDS),
+                TaskKind::PullRequest,
                 InboxReason::Own,
             ),
-        ] {
-            out.extend(parse_tasks(
-                &self.runner.run(&args)?,
-                TaskKind::PullRequest,
-                reason,
-            )?);
+        ];
+        let calls: Vec<Vec<String>> = searches.iter().map(|(args, ..)| args.clone()).collect();
+        let mut out = Vec::new();
+        for (raw, (_, kind, reason)) in self.runner.run_batch(&calls).into_iter().zip(searches) {
+            out.extend(parse_tasks(&raw?, kind, reason)?);
         }
         // Mark tasks in repositories the user owns (repo owner == login), so the
         // client can offer a "My repos" vs "All" scope. Derived from the project
@@ -544,12 +737,20 @@ impl<R: GhRunner> GithubBackend<R> {
     /// the dashboard can triage handled from pending; each item carries a `read`
     /// flag ([`notification_from_gh`]) for the client to filter on.
     pub fn list_notifications(&self) -> Result<Vec<entities::Notification>, Error> {
+        let mut items = self.notifications_plain()?;
+        self.link_check_suite_runs(&mut items);
+        Ok(items)
+    }
+
+    /// The same list without resolving CI links. Callers that only need the items
+    /// themselves (counting unread, say) take this: resolving costs one Actions
+    /// call per repository with a CI notification and buys nothing when no link is
+    /// displayed.
+    fn notifications_plain(&self) -> Result<Vec<entities::Notification>, Error> {
         let raw = self.runner.run(&["api", "notifications?all=true"])?;
         let arr: Vec<Value> = serde_json::from_slice(&raw)
             .map_err(|e| Error::Api(format!("parse gh output: {e}")))?;
-        let mut items: Vec<entities::Notification> = arr.iter().map(notification_from_gh).collect();
-        self.link_check_suite_runs(&mut items);
-        Ok(items)
+        Ok(arr.iter().map(notification_from_gh).collect())
     }
 
     /// Upgrade each CI (CheckSuite) notification's link from the repository Actions
@@ -561,18 +762,29 @@ impl<R: GhRunner> GithubBackend<R> {
     /// unchanged.
     fn link_check_suite_runs(&self, items: &mut [entities::Notification]) {
         let is_ci = |i: &entities::Notification| i.kind == entities::NotifKind::CheckSuite;
-        let repos: std::collections::BTreeSet<String> = items
-            .iter()
-            .filter(|i| is_ci(i))
-            .filter_map(|i| i.project.clone())
-            .collect();
-        if repos.is_empty() {
+        // Per repository, the latest CI notification timestamp it has to answer
+        // for. A cached run list is reusable only if it was read after that
+        // instant (see [`runs_cache_is_fresh`]).
+        let mut newest: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for item in items.iter().filter(|i| is_ci(i)) {
+            let Some(repo) = item.project.clone() else {
+                continue;
+            };
+            let updated = item.updated_at.clone().unwrap_or_default();
+            newest
+                .entry(repo)
+                .and_modify(|cur| {
+                    if updated > *cur {
+                        cur.clone_from(&updated);
+                    }
+                })
+                .or_insert(updated);
+        }
+        if newest.is_empty() {
             return;
         }
-        let runs_by_repo: std::collections::HashMap<String, Vec<Value>> = repos
-            .into_iter()
-            .filter_map(|repo| self.fetch_recent_runs(&repo).map(|runs| (repo, runs)))
-            .collect();
+        let runs_by_repo = self.recent_runs_for(&newest);
         for item in items.iter_mut() {
             if !is_ci(item) {
                 continue;
@@ -591,14 +803,55 @@ impl<R: GhRunner> GithubBackend<R> {
         }
     }
 
-    /// A repository's recent workflow runs (`workflow_runs` array), or `None` when
-    /// the Actions API call or its parse fails (kept non-fatal so listing still
-    /// succeeds with the Actions-page fallback).
-    fn fetch_recent_runs(&self, repo: &str) -> Option<Vec<Value>> {
-        let path = format!("repos/{repo}/actions/runs?per_page={GITHUB_MAX_PER_PAGE}");
-        let raw = self.runner.run(&["api", &path]).ok()?;
-        let v: Value = serde_json::from_slice(&raw).ok()?;
-        v.get("workflow_runs").and_then(Value::as_array).cloned()
+    /// Recent workflow runs for each repository in `newest` (repository → latest
+    /// CI notification timestamp). Repositories whose cached list is still valid
+    /// are served from the cache; the rest are fetched in one batch, so a wide
+    /// inbox costs one wave of concurrent calls instead of one round-trip per
+    /// repository. A repository whose call or parse fails is simply absent from
+    /// the result, leaving its notifications on the Actions-page fallback.
+    fn recent_runs_for(
+        &self,
+        newest: &std::collections::BTreeMap<String, String>,
+    ) -> HashMap<String, Vec<Value>> {
+        let account = self.runner.cache_key().map(str::to_owned);
+        let now = chrono::Utc::now();
+        let mut out: HashMap<String, Vec<Value>> = HashMap::new();
+        let mut stale: Vec<String> = Vec::new();
+        for (repo, notif_updated) in newest {
+            let hit = account.as_ref().and_then(|acct| {
+                let cache = runs_cache().lock().expect("runs cache poisoned");
+                cache
+                    .get(&(acct.clone(), repo.clone()))
+                    .filter(|e| runs_cache_is_fresh(e.fetched_at, Some(notif_updated), now))
+                    .map(|e| e.runs.clone())
+            });
+            match hit {
+                Some(runs) => {
+                    out.insert(repo.clone(), runs);
+                }
+                None => stale.push(repo.clone()),
+            }
+        }
+        if stale.is_empty() {
+            return out;
+        }
+        let calls: Vec<Vec<String>> = stale.iter().map(|r| runs_args(r)).collect();
+        for (repo, raw) in stale.into_iter().zip(self.runner.run_batch(&calls)) {
+            let Some(runs) = raw.ok().and_then(|b| parse_runs(&b)) else {
+                continue;
+            };
+            if let Some(acct) = account.clone() {
+                runs_cache().lock().expect("runs cache poisoned").insert(
+                    (acct, repo.clone()),
+                    CachedRuns {
+                        fetched_at: now,
+                        runs: runs.clone(),
+                    },
+                );
+            }
+            out.insert(repo, runs);
+        }
+        out
     }
 
     /// Mark one notification thread as read (`PATCH /notifications/threads/{id}`).
@@ -615,7 +868,7 @@ impl<R: GhRunner> GithubBackend<R> {
     /// endpoint itself reports no count).
     pub fn mark_all_notifications_read(&self) -> Result<u64, Error> {
         let count = self
-            .list_notifications()?
+            .notifications_plain()?
             .iter()
             .filter(|n| !n.read)
             .count() as u64;
@@ -1122,12 +1375,14 @@ mod tests {
 
     #[test]
     fn list_notifications_links_check_suite_to_specific_run() {
-        let runs = json!({"workflow_runs":[
+        // Shaped like the `--jq` projection the backend asks for: a flat array of
+        // the four fields the matcher reads, not the raw `workflow_runs` envelope.
+        let runs = json!([
             {"name":"CI","head_branch":"deps/keyring-core","updated_at":"2026-07-15T11:21:20Z",
              "html_url":"https://github.com/acme/app/actions/runs/999"},
             {"name":"CI","head_branch":"master","updated_at":"2026-07-15T11:21:19Z",
              "html_url":"https://github.com/acme/app/actions/runs/111"}
-        ]})
+        ])
         .to_string()
         .into_bytes();
         let gh = CiGh {
@@ -1153,6 +1408,158 @@ mod tests {
             out[0].url.as_deref(),
             Some("https://github.com/acme/app/actions")
         );
+    }
+
+    #[test]
+    fn runs_request_projects_to_the_matched_fields() {
+        let args = runs_args("acme/app");
+        assert_eq!(
+            args,
+            vec![
+                "api".to_owned(),
+                "repos/acme/app/actions/runs?per_page=100".to_owned(),
+                "--jq".to_owned(),
+                "[.workflow_runs[] | {name, head_branch, updated_at, html_url}]".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn runs_cache_reuse_requires_snapshot_newer_than_the_notification() {
+        let at = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        };
+        let fetched = at("2026-07-15T12:00:00Z");
+        let now = at("2026-07-15T12:01:00Z");
+        // Notification predates the snapshot → the run it names was already in it.
+        assert!(runs_cache_is_fresh(
+            fetched,
+            Some("2026-07-15T11:59:59Z"),
+            now
+        ));
+        // Notification is newer than the snapshot → its run may be missing there.
+        assert!(!runs_cache_is_fresh(
+            fetched,
+            Some("2026-07-15T12:00:01Z"),
+            now
+        ));
+        // Same instant is still covered by the snapshot.
+        assert!(runs_cache_is_fresh(
+            fetched,
+            Some("2026-07-15T12:00:00Z"),
+            now
+        ));
+        // Past the TTL nothing is reused, however old the notification is.
+        assert!(!runs_cache_is_fresh(
+            fetched,
+            Some("2026-07-15T10:00:00Z"),
+            at("2026-07-15T12:10:00Z")
+        ));
+        // An unusable timestamp cannot prove the snapshot covers the run.
+        assert!(!runs_cache_is_fresh(fetched, Some("not a date"), now));
+        assert!(!runs_cache_is_fresh(fetched, None, now));
+    }
+
+    /// Runner counting how often each endpoint was hit, reporting a caller-chosen
+    /// cache key so a test can exercise the cached and uncached paths.
+    struct CountingGh {
+        key: Option<&'static str>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl CountingGh {
+        fn new(key: Option<&'static str>) -> Self {
+            Self {
+                key,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn count_of(&self, needle: &str) -> usize {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| c.contains(needle))
+                .count()
+        }
+    }
+
+    impl GhRunner for CountingGh {
+        fn run(&self, args: &[&str]) -> Result<Vec<u8>, Error> {
+            self.calls.lock().unwrap().push(args.join(" "));
+            match (args.first().copied(), args.get(1).copied()) {
+                (Some("api"), Some("user")) => Ok(b"testuser".to_vec()),
+                // Writes (`api -X PUT notifications`) answer empty.
+                (Some("api"), Some("-X")) => Ok(Vec::new()),
+                (Some("api"), Some(p)) if p.starts_with("notifications") => Ok(ci_notification()),
+                (Some("api"), Some(p)) if p.contains("/actions/runs") => Ok(json!([
+                    {"name":"CI","head_branch":"deps/keyring-core",
+                     "updated_at":"2026-07-15T11:21:20Z",
+                     "html_url":"https://github.com/acme/app/actions/runs/999"}
+                ])
+                .to_string()
+                .into_bytes()),
+                (Some("search"), _) => Ok(b"[]".to_vec()),
+                _ => Err(Error::Api(format!("unexpected gh args: {args:?}"))),
+            }
+        }
+
+        fn cache_key(&self) -> Option<&str> {
+            self.key
+        }
+    }
+
+    #[test]
+    fn mark_all_read_counts_without_resolving_ci_links() {
+        // The inbox here is a CI notification, so listing it for display would
+        // fetch the repository's runs. Counting unread must not: no link is shown.
+        let gh = CountingGh::new(None);
+        let count = GithubBackend::new(&gh)
+            .mark_all_notifications_read()
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(gh.count_of("/actions/runs"), 0);
+        // Listing the same inbox for display still resolves the link.
+        GithubBackend::new(&gh).list_notifications().unwrap();
+        assert_eq!(gh.count_of("/actions/runs"), 1);
+    }
+
+    #[test]
+    fn login_lookup_is_cached_per_account() {
+        // A runner without a cache key (every fake but this one) always asks.
+        let uncached = CountingGh::new(None);
+        GithubBackend::new(&uncached).list_my_tasks().unwrap();
+        GithubBackend::new(&uncached).list_my_tasks().unwrap();
+        assert_eq!(uncached.count_of("api user"), 2);
+
+        // With a key the login is read once and reused by later backends.
+        let cached = CountingGh::new(Some("login-cache-test.example"));
+        GithubBackend::new(&cached).list_my_tasks().unwrap();
+        GithubBackend::new(&cached).list_my_tasks().unwrap();
+        assert_eq!(cached.count_of("api user"), 1);
+    }
+
+    #[test]
+    fn workflow_runs_are_reused_while_the_snapshot_still_covers_the_notification() {
+        let uncached = CountingGh::new(None);
+        GithubBackend::new(&uncached).list_notifications().unwrap();
+        GithubBackend::new(&uncached).list_notifications().unwrap();
+        assert_eq!(uncached.count_of("/actions/runs"), 2);
+
+        // The notification is dated well in the past, so the first snapshot
+        // answers for it and the second poll issues no Actions call at all.
+        let cached = CountingGh::new(Some("runs-cache-test.example"));
+        let first = GithubBackend::new(&cached).list_notifications().unwrap();
+        let second = GithubBackend::new(&cached).list_notifications().unwrap();
+        assert_eq!(cached.count_of("/actions/runs"), 1);
+        // The cached pass resolves the same specific run as the fetched one.
+        assert_eq!(
+            second[0].url.as_deref(),
+            Some("https://github.com/acme/app/actions/runs/999")
+        );
+        assert_eq!(first[0].url, second[0].url);
     }
 
     #[test]

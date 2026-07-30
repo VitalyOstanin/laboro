@@ -5,6 +5,22 @@ The format follows Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+- GitHub synchronization is several times faster. The five task searches and the
+  per-repository workflow-run lookups now run as one concurrent batch instead of
+  one after another, the run lookups request only the four fields the CI-link
+  matcher reads, their results are reused between polls while the snapshot still
+  covers the notification, and the account login is read once per process.
+  Measured on a 50-notification inbox: notifications 43.6 s to 6.0 s, tasks 9.9 s
+  to 2.4 s, with byte-identical output.
+- Counting unread notifications no longer resolves CI links (up to one Actions
+  call per repository, for links nothing displays), so marking them read costs a
+  single request.
+- Each `gh` invocation receives the token in its environment instead of reading
+  the keyring itself; the token is read once per process. Concurrent keyring
+  reads serialize on the Secret Service, which showed as 5.7 s against 2.1 s over
+  fifteen parallel calls.
+
 ## [0.1.8] - 2026-07-21
 
 ### Added
