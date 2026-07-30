@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "laba-cli"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "laba-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "apple-native-keyring-store",
  "async-trait",
@@ -2571,7 +2571,7 @@ dependencies = [
 
 [[package]]
 name = "laba-gui"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ksni",
  "laba-core",

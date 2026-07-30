@@ -5,6 +5,8 @@ The format follows Keep a Changelog and Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-07-30
+
 ### Changed
 - GitHub synchronization is several times faster. The five task searches and the
   per-repository workflow-run lookups now run as one concurrent batch instead of
